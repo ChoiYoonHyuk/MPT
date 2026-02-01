@@ -978,7 +978,7 @@ def train_mpt(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="MUTAG", help="Any TUDataset name, e.g., MUTAG / NCI1 / PROTEINS / IMDB-BINARY ...")
+    parser.add_argument("--dataset", type=str, default="MUTAG", help="Any TUDataset name, e.g., MUTAG / NCI1 / PROTEINS / IMDB-BINARY / ...")
     parser.add_argument("--data_root", type=str, default="./data")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--test_ratio", type=float, default=0.2)
