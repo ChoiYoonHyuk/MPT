@@ -1,8 +1,9 @@
 import math
 import random
 import heapq
+import argparse
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Iterable, Any, Set
+from typing import Dict, List, Tuple, Optional, Iterable, Set
 
 import numpy as np
 import networkx as nx
@@ -13,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sklearn.cluster import KMeans
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
 try:
     from torch_geometric.data import Data
@@ -21,9 +22,7 @@ try:
     from torch_geometric.nn import GINConv, global_add_pool
     from torch_geometric.datasets import TUDataset
 except Exception as e:
-    raise ImportError(
-        "PyTorch not installed"
-    ) from e
+    raise ImportError("PyTorch / PyG not installed") from e
 
 
 def set_seed(seed: int = 0):
@@ -31,6 +30,49 @@ def set_seed(seed: int = 0):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def attach_indices(dataset: List[Data]) -> List[Data]:
+    for i, d in enumerate(dataset):
+        d.idx = torch.tensor([i], dtype=torch.long)
+    return dataset
+
+
+def ensure_node_features(dataset: List[Data]):
+    if dataset[0].x is None:
+        for d in dataset:
+            d.x = torch.ones((d.num_nodes, 1), dtype=torch.float32)
+
+
+def stratified_split(
+    dataset: List[Data],
+    test_ratio: float,
+    seed: int,
+) -> Tuple[List[Data], List[Data]]:
+    y = np.array([int(d.y.item()) for d in dataset], dtype=np.int64)
+    splitter = StratifiedShuffleSplit(
+        n_splits=1, test_size=test_ratio, random_state=seed
+    )
+    idx_all = np.arange(len(dataset))
+    tr_idx, te_idx = next(splitter.split(idx_all, y))
+    train_set = [dataset[i] for i in tr_idx]
+    test_set = [dataset[i] for i in te_idx]
+    return train_set, test_set
+
+
+@torch.no_grad()
+def evaluate_accuracy(model: nn.Module, loader: DataLoader, device: str) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for b in loader:
+        b = b.to(device)
+        logits = model(b)
+        pred = logits.argmax(dim=-1)
+        y = b.y.view(-1)
+        correct += int((pred == y).sum().item())
+        total += int(y.numel())
+    return (correct / total) if total > 0 else 0.0
 
 
 def to_undirected_edge_set(edge_index: torch.Tensor) -> Set[Tuple[int, int]]:
@@ -52,8 +94,10 @@ def edge_set_to_edge_index(edges: Set[Tuple[int, int]], num_nodes: int) -> torch
     rows = []
     cols = []
     for u, v in edges:
-        rows.append(u); cols.append(v)
-        rows.append(v); cols.append(u)
+        rows.append(u)
+        cols.append(v)
+        rows.append(v)
+        cols.append(u)
     return torch.tensor([rows, cols], dtype=torch.long)
 
 
@@ -79,6 +123,8 @@ def nx_to_data_with_same_x(base: Data, g: nx.Graph) -> Data:
         y=base.y,
         num_nodes=base.num_nodes
     )
+    if hasattr(base, "idx"):
+        out.idx = base.idx
     return out
 
 
@@ -478,14 +524,17 @@ class StabilityEstimator:
         partitions = []
         n = len(dataset)
 
-        num_node_features = int(dataset[0].num_node_features) if dataset[0].x is not None else int(dataset[0].x.size(-1))
+        if dataset[0].x is None:
+            num_node_features = 1
+        else:
+            num_node_features = int(dataset[0].x.size(-1))
 
         for p in range(self.pseudo_env_P):
             seed = self.seed + 1000 * p
             skf = StratifiedKFold(n_splits=self.crossfit_folds, shuffle=True, random_state=seed)
             logits_all = np.zeros((n, num_classes), dtype=np.float32)
 
-            for fold, (tr_idx, te_idx) in enumerate(skf.split(np.zeros(n), y)):
+            for _, (tr_idx, te_idx) in enumerate(skf.split(np.zeros(n), y)):
                 tr_set = [dataset[i] for i in tr_idx]
                 te_set = [dataset[i] for i in te_idx]
                 tr_loader = DataLoader(tr_set, batch_size=64, shuffle=True)
@@ -529,7 +578,6 @@ class StabilityEstimator:
                     continue
 
                 for u in range(U):
-                    good_envs = []
                     delta_list = []
 
                     for e in range(E):
@@ -544,12 +592,9 @@ class StabilityEstimator:
 
                         pi_y = num_y / (den_y + self.epsilon)
                         pi_ny = num_ny / (den_ny + self.epsilon)
-                        delta = pi_y - pi_ny
+                        delta_list.append(pi_y - pi_ny)
 
-                        good_envs.append(e)
-                        delta_list.append(delta)
-
-                    if len(good_envs) < self.Emin:
+                    if len(delta_list) < self.Emin:
                         r_part[p, ycls, u] = 0.0
                         s_part[p, ycls, u] = +1
                         continue
@@ -561,9 +606,7 @@ class StabilityEstimator:
 
                     agree = np.mean((np.sign(delta_arr + 1e-12) == sgn).astype(np.float32))
                     dmin = float(np.min(np.abs(delta_arr)))
-
-                    r = float(agree * min(1.0, dmin / self.tau_delta))
-                    r_part[p, ycls, u] = r
+                    r_part[p, ycls, u] = float(agree * min(1.0, dmin / self.tau_delta))
 
         s_cons = np.ones((C, U), dtype=np.int32)
         r_cons = np.zeros((C, U), dtype=np.float32)
@@ -582,7 +625,6 @@ class StabilityEstimator:
                 s_mode = +1 if cnt_pos >= cnt_neg else -1
 
                 b_agree = np.mean([(1.0 if s_part[p, ycls, u] == s_mode else 0.0) for p in p_support]).item()
-
                 r_min = min(r_part[p, ycls, u] for p in p_support if s_part[p, ycls, u] == s_mode)
                 r_val = float(b_agree * r_min)
                 r_val = min(r_val, self.r_max)
@@ -648,21 +690,21 @@ def compute_intervention_loss(
         return torch.tensor(0.0, device=device)
 
     all_graphs: List[Data] = []
-    meta: List[Tuple[int, int, int, float]] = []
     pos_map: List[List[Tuple[int, int, float]]] = []
     uid_map: List[List[str]] = []
 
-    for item_idx, (Gi, yi, phis) in enumerate(batch_items):
-        g_base_nx = data_to_nx_undirected(Gi)
+    for _, (Gi, _, phis) in enumerate(batch_items):
         per_item = []
         per_uid = []
 
-        for phi_idx, inst in enumerate(phis):
+        for inst in phis:
             g1_data = nx_to_data_with_same_x(Gi, inst.pair.g1)
             g0_data = nx_to_data_with_same_x(Gi, inst.pair.g0)
 
-            pos_g1 = len(all_graphs); all_graphs.append(g1_data)
-            pos_g0 = len(all_graphs); all_graphs.append(g0_data)
+            pos_g1 = len(all_graphs)
+            all_graphs.append(g1_data)
+            pos_g0 = len(all_graphs)
+            all_graphs.append(g0_data)
 
             per_item.append((pos_g1, pos_g0, inst.pair.weight))
             per_uid.append(inst.uid)
@@ -684,7 +726,7 @@ def compute_intervention_loss(
     total = 0.0
     count_items = 0
 
-    for item_idx, (Gi, yi, phis) in enumerate(batch_items):
+    for item_idx, (_, yi, phis) in enumerate(batch_items):
         if len(phis) == 0:
             continue
 
@@ -710,8 +752,8 @@ def compute_intervention_loss(
             hinge = F.relu(torch.tensor(margin_m, device=device) - delta)
 
             js = js_divergence(
-                probs_all[pos_g1:pos_g1+1, :],
-                probs_all[pos_g0:pos_g0+1, :]
+                probs_all[pos_g1:pos_g1 + 1, :],
+                probs_all[pos_g0:pos_g0 + 1, :],
             )[0]
 
             item_loss = item_loss + w_t * (r_yu * hinge + (1.0 - r_yu) * js)
@@ -755,7 +797,7 @@ class MPTConfig:
 
 
 def preprocess_mpt(
-    dataset: List[Data],
+    train_dataset: List[Data],
     predicate_library: PredicateLibrary,
     config: MPTConfig,
     device: str,
@@ -768,13 +810,12 @@ def preprocess_mpt(
 ]:
     set_seed(seed)
 
-    graphs_nx = [data_to_nx_undirected(g) for g in dataset]
-    y = np.array([int(g.y.item()) for g in dataset], dtype=np.int32)
+    graphs_nx = [data_to_nx_undirected(g) for g in train_dataset]
+    y = np.array([int(g.y.item()) for g in train_dataset], dtype=np.int32)
     num_classes = int(y.max()) + 1
 
     Phi_tilde: List[Dict[str, Predicate]] = []
     support: Dict[str, int] = {}
-
     uid_to_predicate: Dict[str, Predicate] = {}
 
     for g in graphs_nx:
@@ -818,7 +859,7 @@ def preprocess_mpt(
     if env_labels is not None:
         partitions = [env_labels.astype(np.int32)]
     else:
-        partitions = stab.infer_pseudo_envs(dataset=dataset, y=y, num_classes=num_classes)
+        partitions = stab.infer_pseudo_envs(dataset=train_dataset, y=y, num_classes=num_classes)
 
     stability_out = stab.compute_stability(
         y=y,
@@ -864,7 +905,7 @@ def preprocess_mpt(
 
 
 def train_mpt(
-    dataset: List[Data],
+    train_dataset: List[Data],
     Phi_instances: List[List[PredicateInstance]],
     stability: StabilityOutputs,
     uid_to_index: Dict[str, int],
@@ -874,15 +915,18 @@ def train_mpt(
 ) -> nn.Module:
     set_seed(seed)
 
-    num_node_features = int(dataset[0].num_node_features)
-    num_classes = int(max(int(d.y.item()) for d in dataset)) + 1
+    if train_dataset[0].x is None:
+        num_node_features = 1
+    else:
+        num_node_features = int(train_dataset[0].x.size(-1))
+    num_classes = int(max(int(d.y.item()) for d in train_dataset)) + 1
 
     model = GINClassifier(num_node_features=num_node_features, num_classes=num_classes)
     model.to(device)
 
     opt = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.wd)
 
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
 
     model.train()
     for epoch in range(1, config.epochs + 1):
@@ -896,10 +940,9 @@ def train_mpt(
             logits = model(batch)
             ce = F.cross_entropy(logits, batch.y.view(-1))
 
-            idx = batch.idx.detach().cpu().numpy().tolist()
-            batch_items = []
             data_list = batch.to_data_list()
-            for di, gi in enumerate(data_list):
+            batch_items = []
+            for gi in data_list:
                 i = int(gi.idx.item())
                 yi = int(gi.y.item())
                 phis = Phi_instances[i]
@@ -933,22 +976,25 @@ def train_mpt(
     return model
 
 
-def attach_indices(dataset: List[Data]) -> List[Data]:
-    for i, d in enumerate(dataset):
-        d.idx = torch.tensor([i], dtype=torch.long)
-    return dataset
-
-
 def main():
-    set_seed(0)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="MUTAG", help="Any TUDataset name, e.g., MUTAG / NCI1 / PROTEINS / IMDB-BINARY ...")
+    parser.add_argument("--data_root", type=str, default="./data")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--test_ratio", type=float, default=0.2)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    dataset = TUDataset(root="./data", name="MUTAG")
-    dataset = attach_indices(list(dataset))
+    full = TUDataset(root=args.data_root, name=args.dataset)
+    full = list(full)
+    ensure_node_features(full)
 
-    if dataset[0].x is None:
-        for d in dataset:
-            d.x = torch.ones((d.num_nodes, 1), dtype=torch.float32)
+    train_set, test_set = stratified_split(full, test_ratio=args.test_ratio, seed=args.seed)
+
+    train_set = attach_indices(train_set)
+    test_set = attach_indices(test_set)
 
     pred_lib = PredicateLibrary(
         degree_thresholds=(2, 3, 4),
@@ -985,37 +1031,34 @@ def main():
     )
 
     Phi_instances, stability, uid_to_index = preprocess_mpt(
-        dataset=dataset,
+        train_dataset=train_set,
         predicate_library=pred_lib,
         config=cfg,
         device=device,
         env_labels=None,
-        seed=0,
+        seed=args.seed,
     )
 
     model = train_mpt(
-        dataset=dataset,
+        train_dataset=train_set,
         Phi_instances=Phi_instances,
         stability=stability,
         uid_to_index=uid_to_index,
         config=cfg,
         device=device,
-        seed=0,
+        seed=args.seed,
     )
 
-    loader = DataLoader(dataset, batch_size=128, shuffle=False)
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for b in loader:
-            b = b.to(device)
-            logits = model(b)
-            pred = logits.argmax(dim=-1)
-            y = b.y.view(-1)
-            correct += int((pred == y).sum().item())
-            total += int(y.numel())
-    print("Train accuracy:", correct / total)
+    train_loader = DataLoader(train_set, batch_size=256, shuffle=False)
+    test_loader = DataLoader(test_set, batch_size=256, shuffle=False)
+
+    train_acc = evaluate_accuracy(model, train_loader, device)
+    test_acc = evaluate_accuracy(model, test_loader, device)
+
+    print(f"\nDataset: {args.dataset}")
+    print(f"Train size: {len(train_set)} | Test size: {len(test_set)}")
+    print(f"Train accuracy: {train_acc:.4f}")
+    print(f"Test accuracy : {test_acc:.4f}")
 
 
 if __name__ == "__main__":
