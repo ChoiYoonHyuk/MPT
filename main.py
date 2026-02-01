@@ -24,6 +24,11 @@ try:
 except Exception as e:
     raise ImportError("PyTorch / PyG not installed") from e
 
+try:
+    from ogb.graphproppred import PygGraphPropPredDataset
+except Exception:
+    PygGraphPropPredDataset = None
+
 
 def set_seed(seed: int = 0):
     random.seed(seed)
@@ -976,9 +981,30 @@ def train_mpt(
     return model
 
 
+def _load_dataset_any(name: str, root: str) -> Tuple[List[Data], Optional[Dict[str, np.ndarray]]]:
+    name = str(name)
+    if name.startswith("ogbg-"):
+        if PygGraphPropPredDataset is None:
+            raise ImportError("ogb is not installed. Please: pip install ogb")
+        ds = PygGraphPropPredDataset(name=name, root=root)
+        split = ds.get_idx_split()
+        train_set = [ds[i] for i in split["train"]]
+        valid_set = [ds[i] for i in split["valid"]]
+        test_set = [ds[i] for i in split["test"]]
+        ensure_node_features(train_set)
+        ensure_node_features(valid_set)
+        ensure_node_features(test_set)
+        return (train_set + valid_set + test_set, {"train": split["train"], "valid": split["valid"], "test": split["test"]})
+    else:
+        full = TUDataset(root=root, name=name)
+        full = list(full)
+        ensure_node_features(full)
+        return full, None
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="MUTAG", help="Any TUDataset name, e.g., MUTAG / NCI1 / PROTEINS / IMDB-BINARY / ...")
+    parser.add_argument("--dataset", type=str, default="MUTAG", help="TUDataset name or ogbg-* (e.g., ogbg-molhiv)")
     parser.add_argument("--data_root", type=str, default="./data")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--test_ratio", type=float, default=0.2)
@@ -987,11 +1013,20 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    full = TUDataset(root=args.data_root, name=args.dataset)
-    full = list(full)
-    ensure_node_features(full)
-
-    train_set, test_set = stratified_split(full, test_ratio=args.test_ratio, seed=args.seed)
+    if args.dataset.startswith("ogbg-"):
+        if PygGraphPropPredDataset is None:
+            raise ImportError("ogb is not installed. Please: pip install ogb")
+        ds = PygGraphPropPredDataset(name=args.dataset, root=args.data_root)
+        split_idx = ds.get_idx_split()
+        train_set = [ds[i] for i in split_idx["train"]]
+        test_set = [ds[i] for i in split_idx["test"]]
+        ensure_node_features(train_set)
+        ensure_node_features(test_set)
+    else:
+        full = TUDataset(root=args.data_root, name=args.dataset)
+        full = list(full)
+        ensure_node_features(full)
+        train_set, test_set = stratified_split(full, test_ratio=args.test_ratio, seed=args.seed)
 
     train_set = attach_indices(train_set)
     test_set = attach_indices(test_set)
